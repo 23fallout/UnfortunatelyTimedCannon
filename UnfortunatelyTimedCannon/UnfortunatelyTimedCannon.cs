@@ -12,6 +12,7 @@ namespace UnfortunatelyTimedCannon
         public static bool AllowFire;
 
         public float rotateMaxCatchUpSpeed = 90f;
+        private bool BADSTUFFHASHAPPENED = false;
         public float catchUpGain = 3f;
         private Transform _target;
         private bool _inSolarSystem;
@@ -42,7 +43,11 @@ namespace UnfortunatelyTimedCannon
         private bool _angVelSaved;
 
         private float _nextOrbitLog;
-
+        public override void Configure(IModConfig config)
+        {
+            randomFireChance = config.GetSettingsValue<float>("Random Fire Chance");
+            randomFireInterval = config.GetSettingsValue<float>("Random Fire Interval");
+        }
 
         public void Awake()
         {
@@ -70,7 +75,7 @@ namespace UnfortunatelyTimedCannon
         {
             if (!testSkipTracking) DoTracking();
 
-            if (!testSkipTracking) DoTracking();
+            // if (!testSkipTracking) DoTracking(); why call it twice? may cause issues
             PinProbe();
 
             if (_inSolarSystem)
@@ -106,10 +111,22 @@ namespace UnfortunatelyTimedCannon
             if (!_hasFired) CheckPad();
             if (!_hasFired) CheckRandomFire();
 
+            if (_probeSpent) return; // probe already did mi bombo on  u
+
+            if (_hasFired && _probeBody == null) { _probeSpent = true; _hasFired = false; return; }
+
             if (_hasFired && _probeBody != null)
             {
                 ReleaseCannonRotation();
                 _flightTimer += Time.fixedDeltaTime;
+                if (_flightTimer > 60f)
+                {
+                    Destroy(_probeBody.gameObject);
+                    _probeSpent = true;
+                    _hasFired = false;
+                    ModHelper.Console.WriteLine("Probe took too long :(");
+                    return;
+                }
                 Vector3 currentProbePos = _probeBody.transform.position;
 
                 Transform targetTransform = Locator.GetPlayerTransform();
@@ -145,6 +162,9 @@ namespace UnfortunatelyTimedCannon
                             if (PlayerState.IsInsideShip())
                                 SendImpact(Locator.GetShipBody(), relVel);
                         }
+
+                        //boom it hit, so we destroy it
+                        Destroy(_probeBody.gameObject);
                         _probeSpent = true;
                         _hasFired = false;
                         return;
@@ -271,6 +291,8 @@ namespace UnfortunatelyTimedCannon
         {
             if (_hasFired || _probeSpent) return;
 
+            if (_probeBody == null) { if (!BADSTUFFHASHAPPENED) /* this is so tricky lmao */ ModHelper.Console.WriteLine("oh noosies probe body is null", MessageType.Error); BADSTUFFHASHAPPENED = true; return; }
+
             if (_ctrl == null)
             {
                 _ctrl = FindObjectOfType<OrbitalProbeLaunchController>();
@@ -331,12 +353,13 @@ namespace UnfortunatelyTimedCannon
             void Set(string field, object value) => AccessTools.Field(typeof(ImpactData), field).SetValue(data, value);
             Set("velocity", relativeVelocity);
             Set("speed", relativeVelocity.magnitude);
-            Set("contactSurfaceTypes", new SurfaceType[0]);
+            Set("contactSurfaceTypes", new SurfaceType[] { SurfaceType.None });
             Set("thisBody", victim);
             Set("otherBody", _probeBody);
             Set("otherCollider", probeCol);
             Set("point", victim.transform.position);
             Set("normal", -relativeVelocity.normalized);
+            Set("thisCollider", victim.GetComponentInChildren<Collider>()); // might throw without this
 
             var del = ImpactEventField.GetValue(sensor) as System.Delegate;
             if (del == null) return;
@@ -375,6 +398,7 @@ namespace UnfortunatelyTimedCannon
             _probeSpent = false;
             _probeDocked = false;
             _angVelSaved = false;
+            BADSTUFFHASHAPPENED = false;
 
             if (_inSolarSystem)
             {
@@ -489,11 +513,20 @@ namespace UnfortunatelyTimedCannon
 
                 if (probeBody == null) return false;
 
-                UnfortunatelyTimedCannon.Instance._probeDocked = false;  
+                UnfortunatelyTimedCannon.Instance._probeDocked = false;
 
                 probeBody.transform.SetParent(null, true);
                 foreach (var c in probeBody.GetComponentsInChildren<Collider>(true))
                     c.enabled = true;
+
+                var probeColliders = probeBody.GetComponentsInChildren<Collider>(true);
+                var cannonColliders = __instance.GetComponentsInChildren<Collider>(true);
+                foreach (var cc in cannonColliders)
+                {
+                    if (cc == null || System.Array.IndexOf(probeColliders, cc) >= 0) continue;
+                    foreach (var pc in probeColliders)
+                        Physics.IgnoreCollision(pc, cc, true); // prevent the probe from colliding with the... launcher ig?
+                }
 
                 probeBody.MakeNonKinematic();
                 probeBody.EnableCollisionDetection();
