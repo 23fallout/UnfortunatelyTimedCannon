@@ -2,6 +2,7 @@
 using OWML.Common;
 using OWML.ModHelper;
 using System.Reflection;
+using System.Collections.Generic;
 using UnityEngine;
 
 namespace UnfortunatelyTimedCannon
@@ -40,10 +41,15 @@ namespace UnfortunatelyTimedCannon
         private Quaternion _probeLocalRot;
         private Vector3 _origAngVel;
         private bool _angVelSaved;
+        private bool _inVessel;
 
         private float _nextOrbitLog;
 
-
+        public override void Configure(IModConfig config)
+        {
+            randomFireChance = config.GetSettingsValue<float>("Random Fire Chance");
+            randomFireInterval = config.GetSettingsValue<float>("Random Fire Interval");
+        }
         public void Awake()
         {
             Instance = this;
@@ -68,8 +74,6 @@ namespace UnfortunatelyTimedCannon
 
         private void FixedUpdate()
         {
-            if (!testSkipTracking) DoTracking();
-
             if (!testSkipTracking) DoTracking();
             PinProbe();
 
@@ -105,6 +109,7 @@ namespace UnfortunatelyTimedCannon
 
             if (!_hasFired) CheckPad();
             if (!_hasFired) CheckRandomFire();
+            if (!_hasFired) CheckVessel();
 
             if (_hasFired && _probeBody != null)
             {
@@ -153,7 +158,7 @@ namespace UnfortunatelyTimedCannon
                     Vector3 toTarget = targetPos - currentProbePos;
                     float speed = _probeBody.GetVelocity().magnitude;
 
-                    float steerSpeed = _flightTimer < 3f ? 5f : 0.4f;
+                    float steerSpeed = _flightTimer < 3f ? 5f : 2f;
 
                     Vector3 steeredVel = Vector3.RotateTowards(_probeBody.GetVelocity(), toTarget.normalized * speed, steerSpeed * Time.fixedDeltaTime, 0f);
                     _probeBody.SetVelocity(steeredVel);
@@ -229,6 +234,22 @@ namespace UnfortunatelyTimedCannon
             }
         }
 
+        private readonly HashSet<global::AudioType> _triggerTracks = new HashSet<global::AudioType>
+        {
+            global::AudioType.BH_Observatory,
+            global::AudioType.SadNomaiTheme,
+            global::AudioType.DB_VesselDiscovery,
+        };
+
+        private readonly HashSet<global::AudioType> _seenTracks = new HashSet<global::AudioType>();
+
+        public void OnTrackPlayed(global::AudioType track)
+        {
+            if (!_inSolarSystem) return;
+
+            if (_triggerTracks.Contains(track))
+                CannonFire();
+        }
 
         private Vector3 GetClosestPointOnSegment(Vector3 s1, Vector3 s2, Vector3 p)
         {
@@ -243,6 +264,21 @@ namespace UnfortunatelyTimedCannon
         private void LateUpdate()
         {
             PinProbe();
+        }
+
+        private void CheckVessel()
+        {
+            var det = Locator.GetPlayerSectorDetector();
+            if (det == null) return;
+
+            bool inside = det.IsWithinSector(Sector.Name.Vessel);
+            if (inside != _inVessel)
+            {
+                _inVessel = inside;
+                ModHelper.Console.WriteLine(inside ? "Inside Vessel" : "Outside Vessel", MessageType.Info);
+            }
+
+            if (inside) CannonFire();
         }
 
         private void PinProbe()
@@ -270,6 +306,7 @@ namespace UnfortunatelyTimedCannon
         public void CannonFire()
         {
             if (_hasFired || _probeSpent) return;
+
 
             if (_ctrl == null)
             {
@@ -331,12 +368,13 @@ namespace UnfortunatelyTimedCannon
             void Set(string field, object value) => AccessTools.Field(typeof(ImpactData), field).SetValue(data, value);
             Set("velocity", relativeVelocity);
             Set("speed", relativeVelocity.magnitude);
-            Set("contactSurfaceTypes", new SurfaceType[0]);
+            Set("contactSurfaceTypes", new SurfaceType[] { SurfaceType.None });
             Set("thisBody", victim);
             Set("otherBody", _probeBody);
             Set("otherCollider", probeCol);
             Set("point", victim.transform.position);
             Set("normal", -relativeVelocity.normalized);
+            Set("thisCollider", victim.GetComponentInChildren<Collider>());
 
             var del = ImpactEventField.GetValue(sensor) as System.Delegate;
             if (del == null) return;
@@ -375,6 +413,7 @@ namespace UnfortunatelyTimedCannon
             _probeSpent = false;
             _probeDocked = false;
             _angVelSaved = false;
+            _inVessel = false;
 
             if (_inSolarSystem)
             {
@@ -474,6 +513,23 @@ namespace UnfortunatelyTimedCannon
             static void Postfix()
             {
                 UnfortunatelyTimedCannon.Instance.CannonFire();
+            }
+        }
+
+        [HarmonyPatch]
+        public static class MusicPlayPatch
+        {
+            static IEnumerable<MethodBase> TargetMethods()
+            {
+                string[] names = { "Play", "PlayDelayed", "PlayWithLibraryVolume", "FadeIn", "FadeInToLibraryVolume" };
+                foreach (var m in AccessTools.GetDeclaredMethods(typeof(OWAudioSource)))
+                    if (System.Array.IndexOf(names, m.Name) >= 0)
+                        yield return m;
+            }
+
+            static void Postfix(OWAudioSource __instance)
+            {
+                UnfortunatelyTimedCannon.Instance.OnTrackPlayed(__instance.audioLibraryClip);
             }
         }
 
