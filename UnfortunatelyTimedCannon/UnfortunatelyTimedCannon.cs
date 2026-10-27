@@ -23,13 +23,11 @@ namespace UnfortunatelyTimedCannon
         private OrbitalProbeLaunchController _ctrl;
         private OWRigidbody _probeBody;
         public float homingStrength = 1500f;
-        private Vector3 _initialCannonUp;
         private float _flightTimer;
         private Vector3 _lastProbePos;
         private static readonly FieldInfo ImpactEventField = AccessTools.Field(typeof(ImpactSensor), "OnImpact");
         private NomaiWarpTransmitter _timeLoopPad;
         private bool _padSearched;
-        private SunStationMusicController _OnOpenEmergancyHatch;
         public float randomFireChance = 0.005f;
         public float randomFireInterval = 60f;
         private float _nextRandomRoll;
@@ -42,6 +40,11 @@ namespace UnfortunatelyTimedCannon
         private Vector3 _origAngVel;
         private bool _angVelSaved;
         private bool _inVessel;
+        public float triggerChance = 0.25f;
+        private bool _wasOnPad;
+        public float musicRetrySeconds = 30f;
+        private readonly Dictionary<global::AudioType, OWAudioSource> _activeTriggerSources = new Dictionary<global::AudioType, OWAudioSource>();
+        private readonly Dictionary<global::AudioType, float> _cooldownUntil = new Dictionary<global::AudioType, float>();
 
         private float _nextOrbitLog;
 
@@ -80,7 +83,7 @@ namespace UnfortunatelyTimedCannon
             if (_inSolarSystem)
             {
                 var astro = Locator.GetAstroObject(AstroObject.Name.ProbeCannon);
-                if (astro != null) LogOrbit(astro.GetOWRigidbody());
+                //if (astro != null) LogOrbit(astro.GetOWRigidbody());
             }
         }
 
@@ -106,6 +109,8 @@ namespace UnfortunatelyTimedCannon
         {
             if (!_inSolarSystem) return;
             if (_ctrl == null) return;
+
+            CheckMusicRetries();
 
             if (!_hasFired) CheckPad();
             if (!_hasFired) CheckRandomFire();
@@ -170,6 +175,7 @@ namespace UnfortunatelyTimedCannon
 
             if (_target == null) CannonTrack();
             if (_target == null) return;
+
 
             Vector3 playerPos = _target.position;
             Vector3 playerVel = Vector3.zero;
@@ -241,14 +247,60 @@ namespace UnfortunatelyTimedCannon
             global::AudioType.DB_VesselDiscovery,
         };
 
-        private readonly HashSet<global::AudioType> _seenTracks = new HashSet<global::AudioType>();
 
-        public void OnTrackPlayed(global::AudioType track)
+        public void OnTrackPlayed(OWAudioSource source)
         {
-            if (!_inSolarSystem) return;
+            if (!_inSolarSystem || source == null) return;
+            if (_hasFired || _probeSpent) return;
 
-            if (_triggerTracks.Contains(track))
-                CannonFire();
+            var track = source.audioLibraryClip;
+            if (!_triggerTracks.Contains(track)) return;
+
+            _activeTriggerSources[track] = source;
+
+            if (_cooldownUntil.TryGetValue(track, out float until) && Time.time < until) return;
+
+            RollForTrack(track);
+        }
+
+        private void RollForTrack(global::AudioType track)
+        {
+            if (TryFire())
+            {
+                _activeTriggerSources.Clear();
+                _cooldownUntil.Clear();
+            }
+            else
+            {
+                _cooldownUntil[track] = Time.time + musicRetrySeconds;
+                ModHelper.Console.WriteLine($"{track}: cooling down for {musicRetrySeconds:F0}s", MessageType.Info);
+            }
+        }
+
+        private void CheckMusicRetries()
+        {
+            if (_activeTriggerSources.Count == 0) return;
+
+            if (_hasFired || _probeSpent)
+            {
+                _activeTriggerSources.Clear();
+                _cooldownUntil.Clear();
+                return;
+            }
+
+            foreach (var track in new List<global::AudioType>(_activeTriggerSources.Keys))
+            {
+                if (!_activeTriggerSources.TryGetValue(track, out var src)) continue;
+
+                if (src == null || !src.isPlaying)      
+                {
+                    _activeTriggerSources.Remove(track);
+                    continue;
+                }
+
+                if (!_cooldownUntil.TryGetValue(track, out float until) || Time.time >= until)
+                    RollForTrack(track);
+            }
         }
 
         private Vector3 GetClosestPointOnSegment(Vector3 s1, Vector3 s2, Vector3 p)
@@ -276,9 +328,22 @@ namespace UnfortunatelyTimedCannon
             {
                 _inVessel = inside;
                 ModHelper.Console.WriteLine(inside ? "Inside Vessel" : "Outside Vessel", MessageType.Info);
+                if (inside) TryFire();            
             }
+        }
 
-            if (inside) CannonFire();
+        public bool TryFire()
+        {
+            if (_hasFired || _probeSpent) return false;
+
+            float roll = Random.value;
+            bool hit = roll < triggerChance;
+            ModHelper.Console.WriteLine(
+                $"Trigger roll {roll:F2} (need < {triggerChance:F2}): {(hit ? "FIRE" : "no")}",
+                MessageType.Info);
+
+            if (hit) CannonFire();
+            return hit;
         }
 
         private void PinProbe()
@@ -352,8 +417,9 @@ namespace UnfortunatelyTimedCannon
 
             if (_timeLoopPad == null) return;
 
-            if (_timeLoopPad.IsPlayerOnPlatform())
-                CannonFire();
+            bool onPad = _timeLoopPad.IsPlayerOnPlatform();
+            if (onPad && !_wasOnPad) TryFire();     
+            _wasOnPad = onPad;
         }
 
         private void SendImpact(OWRigidbody victim, Vector3 relativeVelocity)
@@ -414,6 +480,9 @@ namespace UnfortunatelyTimedCannon
             _probeDocked = false;
             _angVelSaved = false;
             _inVessel = false;
+            _wasOnPad = false;
+            _activeTriggerSources.Clear();
+            _cooldownUntil.Clear();
 
             if (_inSolarSystem)
             {
@@ -503,7 +572,7 @@ namespace UnfortunatelyTimedCannon
             static void Postfix(GameObject hitObj)
             {
                 if (hitObj.CompareTag("PlayerDetector"))
-                    UnfortunatelyTimedCannon.Instance.CannonFire();
+                    UnfortunatelyTimedCannon.Instance.TryFire();
             }
         }
 
@@ -512,7 +581,7 @@ namespace UnfortunatelyTimedCannon
         {
             static void Postfix()
             {
-                UnfortunatelyTimedCannon.Instance.CannonFire();
+                UnfortunatelyTimedCannon.Instance.TryFire();
             }
         }
 
@@ -529,7 +598,7 @@ namespace UnfortunatelyTimedCannon
 
             static void Postfix(OWAudioSource __instance)
             {
-                UnfortunatelyTimedCannon.Instance.OnTrackPlayed(__instance.audioLibraryClip);
+                UnfortunatelyTimedCannon.Instance.OnTrackPlayed(__instance);
             }
         }
 
